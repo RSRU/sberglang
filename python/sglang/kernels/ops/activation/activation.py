@@ -62,7 +62,7 @@ def activation_module(dtype: torch.dtype, *, fast_math: bool = True) -> Module:
 
 
 SUPPORTED_ACTIVATIONS = {"silu", "gelu", "gelu_tanh"}
-SUPPORTED_UNARY_ACTIVATIONS = {"relu2"}
+SUPPORTED_UNARY_ACTIVATIONS = {"relu2", "new_gelu"}
 
 
 @register_custom_op(mutates_args=["out"])
@@ -169,6 +169,14 @@ def run_unary_activation(
         out = torch.empty_like(input)
     _run_unary_activation_inplace(op_name, input, out)
     return out
+
+
+def new_gelu(
+    input: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """GPT-2 NewGELU: ``0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 x^3)))``."""
+    return run_unary_activation("new_gelu", input, out)
 
 
 def relu2(
