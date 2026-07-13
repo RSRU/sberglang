@@ -48,6 +48,8 @@ from sglang.srt.utils.common import (
     is_hip,
     is_musa,
     is_npu,
+    is_pre_sm80,
+    is_sm70_volta,
     is_sm90_supported,
     is_sm100_supported,
     is_sm120_supported,
@@ -1439,6 +1441,8 @@ def _enforce_disable_allreduce_fusion(view: Any) -> dict:
 @register_post_process
 def _sampling_backend_default(view: Any) -> dict:
     if view.sampling_backend is None:
+        if is_cuda() and is_sm70_volta():
+            return {"sampling_backend": "pytorch"}
         return {
             "sampling_backend": (
                 "flashinfer" if is_flashinfer_available() else "pytorch"
@@ -1740,7 +1744,55 @@ def _attention_backend_platform_fallbacks(view: Any) -> dict:
             "The current platform does not support Intel XMX, will fallback to triton backend."
         )
         return {"attention_backend": "triton"}
+    if is_cuda() and is_sm70_volta():
+        return _volta_attention_backend_fallback(view)
     return {}
+
+
+def _volta_attention_backend_fallback(view: Any) -> dict:
+    """Volta (V100) lacks FlashInfer and native bf16; prefer triton + CUDA graphs."""
+    overrides: dict = {}
+    resolved = resolved_view(view)
+    unsupported = {
+        "flashinfer",
+        "fa3",
+        "fa4",
+        "trtllm_mha",
+        "trtllm_mla",
+        "flashmla",
+        "cutlass_mla",
+        "tokenspeed_mla",
+    }
+    for field in (
+        "attention_backend",
+        "prefill_attention_backend",
+        "decode_attention_backend",
+    ):
+        backend = getattr(resolved, field, None)
+        if backend in unsupported:
+            logger.warning(
+                "Volta (V100) does not support %s; falling back to triton for %s.",
+                backend,
+                field,
+            )
+            overrides[field] = "triton"
+    if resolved.attention_backend is None and not any(
+        k.endswith("attention_backend") for k in overrides
+    ):
+        logger.info(
+            "Volta (V100) detected: using triton attention backend by default."
+        )
+        overrides["attention_backend"] = "triton"
+    if view.sampling_backend == "flashinfer":
+        overrides["sampling_backend"] = "pytorch"
+    if view.dtype in (None, "auto", "bfloat16", "bf16"):
+        overrides["dtype"] = "float16"
+    elif is_pre_sm80() and view.dtype == "bfloat16":
+        logger.warning(
+            "Volta/Turing GPU detected with bfloat16; falling back to float16."
+        )
+        overrides["dtype"] = "float16"
+    return overrides
 
 
 @register_post_process

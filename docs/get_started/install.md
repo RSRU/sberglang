@@ -227,4 +227,16 @@ echo "Build and push completed successfully!"
 ## Common Notes
 
 - [FlashInfer](https://github.com/flashinfer-ai/flashinfer) is the default attention kernel backend. It only supports sm75 and above. If you encounter any FlashInfer-related issues on sm75+ devices (e.g., T4, A10, A100, L4, L40S, H100), please switch to other kernels by adding `--attention-backend triton --sampling-backend pytorch` and open an issue on GitHub.
+- **Volta (V100, sm_70)** is supported with automatic fallbacks to `--attention-backend triton`, `--sampling-backend pytorch`, and `--dtype float16`. FlashInfer is not available on sm_70. Example for a 4×V100 node with tensor parallelism:
+
+  ```bash
+  python -m sglang.launch_server \
+    --model-path meta-llama/Llama-2-13b-chat-hf \
+    --tp 4 \
+    --dtype float16 \
+    --attention-backend triton \
+    --sampling-backend pytorch
+  ```
+
+  Decode CUDA graphs remain enabled with the Triton backend and are recommended for low-latency serving on V100.
 - To reinstall flashinfer locally, use the following command: `pip3 install --upgrade flashinfer-python --force-reinstall --no-deps` and then delete the cache with `rm -rf ~/.cache/flashinfer`.

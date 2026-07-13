@@ -20,7 +20,7 @@ from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.utils import is_sm100_supported
+from sglang.srt.utils import get_device_capability, is_cuda, is_sm100_supported
 
 logger = logging.getLogger(__name__)
 
@@ -207,6 +207,17 @@ def _maybe_init_config():
             6: ModeConfig(1 * MB, 1 * MB),
             7: ModeConfig(896 * KB, 896 * KB),
             8: ModeConfig(720 * KB, 720 * KB),
+        }
+    elif is_cuda() and get_device_capability()[0] == 7:
+        # NOTE: Volta/Turing (V100/T4). PCIe/NVLink bandwidth is lower than Hopper.
+        THRESHOLD_2_SHOT_MAP = {
+            2: ModeConfig(1 * MB, INF),
+            3: ModeConfig(384 * KB, 384 * KB),
+            4: ModeConfig(256 * KB, 192 * KB),
+            5: ModeConfig(192 * KB, 192 * KB),
+            6: ModeConfig(160 * KB, 160 * KB),
+            7: ModeConfig(128 * KB, 128 * KB),
+            8: ModeConfig(128 * KB, 128 * KB),
         }
     else:
         # NOTE: This result is based on benchmarks on H200 GPUs

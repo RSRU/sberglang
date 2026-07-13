@@ -6,6 +6,106 @@ import triton.language as tl
 
 
 @triton.jit
+def write_req_to_token_pool_triton_optimize(
+    req_to_token_ptr,  # [max_batch, max_context_len]
+    req_pool_indices,
+    prefix_tensors,
+    pre_lens,
+    seq_lens,
+    extend_lens,
+    extend_start_loc,
+    out_cache_loc,
+    req_to_token_ptr_stride: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid_batch = tl.program_id(0)
+    pid_token = tl.program_id(1)
+
+    req_pool_index = tl.load(req_pool_indices + pid_batch)
+    pre_len = tl.load(pre_lens + pid_batch)
+    seq_len = tl.load(seq_lens + pid_batch)
+    prefix_tensor = tl.load(prefix_tensors + pid_batch).to(tl.pointer_type(tl.int64))
+    extend_len = seq_len - pre_len
+
+    if pid_token == 0:
+        num_prefix_loop = tl.cdiv(pre_len, BLOCK_SIZE)
+        for i in range(num_prefix_loop):
+            offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
+            mask = offset < pre_len
+            value = tl.load(prefix_tensor + offset, mask=mask)
+            tl.store(
+                req_to_token_ptr + req_pool_index * req_to_token_ptr_stride + offset,
+                value,
+                mask=mask,
+            )
+
+    cumsum_start = tl.load(extend_start_loc + pid_batch).to(tl.int64)
+    token_start = pid_token * BLOCK_SIZE
+    offset = tl.arange(0, BLOCK_SIZE)
+    actual_offset = token_start + offset
+    mask = actual_offset < extend_len
+
+    src_ptr = out_cache_loc + cumsum_start + actual_offset
+    src_ptr = tl.max_contiguous(tl.multiple_of(src_ptr, BLOCK_SIZE), BLOCK_SIZE)
+    value = tl.load(src_ptr, mask=mask)
+    dst_ptr = (
+        req_to_token_ptr
+        + req_pool_index * req_to_token_ptr_stride
+        + actual_offset
+        + pre_len
+    )
+    dst_ptr = tl.max_contiguous(tl.multiple_of(dst_ptr, BLOCK_SIZE), BLOCK_SIZE)
+    tl.store(dst_ptr, value, mask=mask)
+
+
+def launch_write_req_to_token_pool_triton(
+    req_to_token: torch.Tensor,
+    req_pool_indices_tensor: torch.Tensor,
+    prefix_pointers: torch.Tensor,
+    prefix_lens_tensor: torch.Tensor,
+    seq_lens_tensor: torch.Tensor,
+    extend_lens_tensor: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+) -> None:
+    batch_size = req_pool_indices_tensor.shape[0]
+    if batch_size == 0:
+        return
+
+    extend_start_loc = torch.zeros_like(extend_lens_tensor)
+    if batch_size > 1:
+        extend_start_loc[1:] = torch.cumsum(extend_lens_tensor[:-1], dim=0)
+
+    max_extend_len = int(torch.max(extend_lens_tensor).item())
+    if max_extend_len == 0:
+        write_req_to_token_pool_triton[(batch_size,)](
+            req_to_token,
+            req_pool_indices_tensor,
+            prefix_pointers,
+            prefix_lens_tensor,
+            seq_lens_tensor,
+            extend_lens_tensor,
+            out_cache_loc,
+            req_to_token.shape[1],
+        )
+        return
+
+    BLOCK_SIZE = 512
+    grid = (batch_size, triton.cdiv(max_extend_len, BLOCK_SIZE))
+    write_req_to_token_pool_triton_optimize[grid](
+        req_to_token,
+        req_pool_indices_tensor,
+        prefix_pointers,
+        prefix_lens_tensor,
+        seq_lens_tensor,
+        extend_lens_tensor,
+        extend_start_loc,
+        out_cache_loc,
+        req_to_token.shape[1],
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+
+
+@triton.jit
 def write_req_to_token_pool_triton(
     req_to_token_ptr,  # [max_batch, max_context_len]
     req_pool_indices,

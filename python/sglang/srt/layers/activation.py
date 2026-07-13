@@ -60,6 +60,7 @@ if _is_cuda:
     from sglang.jit_kernel.activation import (
         gelu_and_mul,
         gelu_tanh_and_mul,
+        new_gelu,
         relu2,
         silu_and_mul,
     )
@@ -193,8 +194,7 @@ class NewGELU(MultiPlatformOp):
         return 0.5 * x * (1.0 + torch.tanh(c * (x + 0.044715 * torch.pow(x, 3.0))))
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
-        # TODO: Implement the CUDA kernel for NewGELU in sgl-kernel
-        return self.forward_native(x)
+        return new_gelu(x)
 
 
 class ReLU2(MultiPlatformOp):

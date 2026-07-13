@@ -216,6 +216,8 @@ struct ActivationKernel {
     using namespace host;
     if (type == "relu2") {
       return ActivationKernel::template unary_kernel<ActivationKind::kReLU2>;
+    } else if (type == "new_gelu" || type == "gelu_tanh") {
+      return ActivationKernel::template unary_kernel<ActivationKind::kGELUTanh>;
     } else {
       Panic("unsupported unary activation type: ", type);
     }

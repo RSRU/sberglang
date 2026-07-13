@@ -23,7 +23,7 @@ from sglang.srt.mem_cache.triton_ops.common import (
 from sglang.srt.mem_cache.triton_ops.common import (
     get_last_loc_triton,
     get_last_loc_triton_safe,
-    write_req_to_token_pool_triton,
+    launch_write_req_to_token_pool_triton,
 )
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.server_args import ServerArgs
@@ -141,7 +141,7 @@ def write_cache_indices(
             pin_memory=is_pin_memory_available(req_to_token_pool.device),
         ).to(req_to_token_pool.device, non_blocking=True)
         # TODO: some tensors can be reused for ForwardBatchInfo (e.g., extend_lens, cumsum_start)
-        write_req_to_token_pool_triton[(req_pool_indices_tensor.shape[0],)](
+        launch_write_req_to_token_pool_triton(
             req_to_token_pool.req_to_token,
             req_pool_indices_tensor,
             prefix_pointers,
@@ -149,7 +149,6 @@ def write_cache_indices(
             seq_lens_tensor,
             extend_lens_tensor,
             out_cache_loc,
-            req_to_token_pool.req_to_token.shape[1],
         )
     else:
         pt = 0

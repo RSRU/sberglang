@@ -113,6 +113,28 @@ class WaveAttnBackend(AttentionBackend):
 
         self.device = model_runner.device
         self.device_core_count = get_device_core_count(model_runner.gpu_id)
+        self._reuse_attn_output: Optional[torch.Tensor] = None
+        self._reuse_attn_output_key: Optional[tuple] = None
+
+    def _get_reusable_attn_output(
+        self, q: torch.Tensor, layer: RadixAttention
+    ) -> torch.Tensor:
+        if layer.qk_head_dim != layer.v_head_dim:
+            out_shape = (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+            cache_key = (out_shape, q.dtype, q.device)
+            if (
+                self._reuse_attn_output_key != cache_key
+                or self._reuse_attn_output is None
+            ):
+                self._reuse_attn_output = q.new_empty(out_shape)
+                self._reuse_attn_output_key = cache_key
+            return self._reuse_attn_output
+
+        cache_key = (tuple(q.shape), q.dtype, q.device)
+        if self._reuse_attn_output_key != cache_key or self._reuse_attn_output is None:
+            self._reuse_attn_output = torch.empty_like(q)
+            self._reuse_attn_output_key = cache_key
+        return self._reuse_attn_output
 
     def get_num_kv_splits(
         self,
@@ -481,11 +503,7 @@ class WaveAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
-        # TODO: reuse the buffer across layers
-        if layer.qk_head_dim != layer.v_head_dim:
-            o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
-        else:
-            o = torch.empty_like(q)
+        o = self._get_reusable_attn_output(q, layer)
 
         if save_kv_cache:
             self.token_to_kv_pool.set_kv_buffer(
@@ -531,11 +549,7 @@ class WaveAttnBackend(AttentionBackend):
         # output value to have a 3D tensor shape. This reshapes the output correctly.
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
 
-        # TODO: reuse the buffer across layers
-        if layer.qk_head_dim != layer.v_head_dim:
-            o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
-        else:
-            o = torch.empty_like(q)
+        o = self._get_reusable_attn_output(q, layer)
 
         if save_kv_cache:
             self.token_to_kv_pool.set_kv_buffer(

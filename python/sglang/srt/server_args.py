@@ -4641,6 +4641,10 @@ class ServerArgs:
         if not use_mla_backend:
             # MHA architecture
             from sglang.srt.arg_groups.overrides import resolved_view
+            from sglang.srt.utils.common import is_sm70_volta
+
+            if is_sm70_volta():
+                return "triton"
 
             if is_hopper_with_cuda_12_3() and is_no_spec_infer_or_topk_one(
                 resolved_view(self)

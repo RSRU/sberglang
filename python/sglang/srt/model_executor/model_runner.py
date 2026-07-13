@@ -1377,8 +1377,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     "ModelRunner._sm80_dtype_fallback", {"dtype": "float16"}
                 )
                 self.model_config.dtype = torch.float16
-                if torch.cuda.get_device_capability()[1] < 5:
-                    raise RuntimeError("SGLang only supports sm75 and above.")
+                major, minor = torch.cuda.get_device_capability()
+                if major < 7:
+                    raise RuntimeError("SGLang only supports sm70 and above.")
+                if major == 7 and minor == 0:
+                    logger.info(
+                        "Volta (sm_70) detected. Use --attention-backend triton "
+                        "and --sampling-backend pytorch for best compatibility."
+                    )
 
         set_cuda_arch()
 
