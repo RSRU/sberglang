@@ -1835,24 +1835,34 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     state.event.wait(), timeout=_REQUEST_STATE_WAIT_TIMEOUT
                 )
             except asyncio.TimeoutError:
-                if (
-                    request is not None
-                    and not obj.background
-                    and await request.is_disconnected()
-                ):
-                    # Abort the request for disconnected requests (non-streaming, waiting queue)
-                    self.abort_request(obj.rid)
-                    # Use exception to kill the whole call stack and asyncio task
+                # Non-streaming requests never reach the `yield` below, so this
+                # periodic poll is the only place a dropped client can be noticed.
+                if request is not None and await request.is_disconnected():
+                    self.abort_request(obj.rid)          # -> AbortReq to the scheduler
                     raise ValueError(
-                        f"Request is disconnected from the client side (type 1). Abort request {obj.rid=}"
+                        f"Request {obj.rid} is disconnected from the client side. Aborted."
                     )
                 continue
-
+               
+            
             # Drain all pending outputs atomically.
-            out_list = state.out_list
-            state.out_list = []
+            out_list = state.out_list[-1]
             finished = state.finished
+            state.out_list = []
+            if state.finished:
+                if self.log_requests:
+                    logger.info(f"Finish: obj={obj}, out={...}")
+                del self.rid_to_state[obj.rid]
+                yield out_list
+                break
+
             state.event.clear()
+            if obj.stream:
+                yield out_list
+            else:
+                if request is not None and await request.is_disconnected():
+                    self.abort_request(obj.rid)
+                    raise ValueError(f"Request {obj.rid} is disconnected from the client side. Aborted.")
 
             # With incremental streaming, each chunk is a delta — coalesce
             # multiple queued chunks to avoid dropping token ids.
