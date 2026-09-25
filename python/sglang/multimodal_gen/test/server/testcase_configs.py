@@ -46,6 +46,9 @@ class ToleranceConfig:
     non_denoise_stage: float
     denoise_step: float
     denoise_agg: float
+    load_peak_vram: float = 0.01
+    runtime_peak_vram: float = 0.02
+    host_anon: float = 0.02
 
     @classmethod
     def load_profile(cls, all_tolerances: dict, profile_name: str) -> ToleranceConfig:
@@ -86,6 +89,19 @@ class ToleranceConfig:
             denoise_agg=float(
                 os.getenv("SGLANG_DENOISE_AGG_TOLERANCE", tol_data["denoise_agg"])
             ),
+            load_peak_vram=float(
+                os.getenv(
+                    "SGLANG_LOAD_PEAK_VRAM_TOLERANCE",
+                    tol_data.get("load_peak_vram", 0.01),
+                )
+            ),
+            runtime_peak_vram=float(
+                os.getenv(
+                    "SGLANG_RUNTIME_PEAK_VRAM_TOLERANCE",
+                    tol_data.get("runtime_peak_vram", 0.02),
+                )
+            ),
+            host_anon=float(tol_data.get("host_anon", 0.02)),
         )
 
 
@@ -99,6 +115,46 @@ class ScenarioConfig:
     expected_avg_denoise_ms: float
     expected_median_denoise_ms: float
     estimated_full_test_time_s: float | None = None
+    load_peak_vram_mb: float | None = None
+    runtime_peak_vram_mb: float | None = None
+    # Peak of the warmup calibration probe (the default workload's full shape
+    # under the load-safe placement); None skips the check until a baseline exists.
+    warmup_peak_vram_mb: float | None = None
+    # Allocated peaks; when present they are the enforced VRAM figure and the
+    # reserved peaks above are reported only (reserved tracks pool history).
+    load_peak_allocated_mb: float | None = None
+    runtime_peak_allocated_mb: float | None = None
+    # Anonymous-host budget caps; None skips the check (older baselines).
+    load_peak_host_anon_mb: float | None = None
+    runtime_peak_host_anon_mb: float | None = None
+    # Per-case override for the wall-clock tolerances (e2e, denoise and stage
+    # timings) when a case's runtime is dominated by shared-runner host I/O
+    # rather than by the code under test. Memory guards keep the profile
+    # tolerance -- they are what such a case actually protects.
+    timing_tolerance: float | None = None
+
+    @classmethod
+    def from_dict(cls, cfg: dict[str, Any]) -> ScenarioConfig:
+        def optional_float(name: str) -> float | None:
+            value = cfg.get(name)
+            return float(value) if value is not None else None
+
+        return cls(
+            stages_ms=cfg["stages_ms"],
+            denoise_step_ms={int(k): v for k, v in cfg["denoise_step_ms"].items()},
+            expected_e2e_ms=float(cfg["expected_e2e_ms"]),
+            expected_avg_denoise_ms=float(cfg["expected_avg_denoise_ms"]),
+            expected_median_denoise_ms=float(cfg["expected_median_denoise_ms"]),
+            estimated_full_test_time_s=optional_float("estimated_full_test_time_s"),
+            load_peak_vram_mb=optional_float("load_peak_vram_mb"),
+            runtime_peak_vram_mb=optional_float("runtime_peak_vram_mb"),
+            warmup_peak_vram_mb=optional_float("warmup_peak_vram_mb"),
+            load_peak_allocated_mb=optional_float("load_peak_allocated_mb"),
+            runtime_peak_allocated_mb=optional_float("runtime_peak_allocated_mb"),
+            load_peak_host_anon_mb=optional_float("load_peak_host_anon_mb"),
+            runtime_peak_host_anon_mb=optional_float("runtime_peak_host_anon_mb"),
+            timing_tolerance=optional_float("timing_tolerance"),
+        )
 
 
 @dataclass
@@ -122,16 +178,10 @@ class BaselineConfig:
             data.get("tolerances", {}), profile_name
         )
 
-        scenarios = {}
-        for name, cfg in data["scenarios"].items():
-            scenarios[name] = ScenarioConfig(
-                stages_ms=cfg["stages_ms"],
-                denoise_step_ms={int(k): v for k, v in cfg["denoise_step_ms"].items()},
-                expected_e2e_ms=float(cfg["expected_e2e_ms"]),
-                expected_avg_denoise_ms=float(cfg["expected_avg_denoise_ms"]),
-                expected_median_denoise_ms=float(cfg["expected_median_denoise_ms"]),
-                estimated_full_test_time_s=cfg.get("estimated_full_test_time_s"),
-            )
+        scenarios = {
+            name: ScenarioConfig.from_dict(cfg)
+            for name, cfg in data["scenarios"].items()
+        }
 
         return cls(
             scenarios=scenarios,
@@ -147,18 +197,12 @@ class BaselineConfig:
         with path.open("r", encoding="utf-8") as fh:
             data = json.load(fh)
 
-        scenarios_new = {}
-        for name, cfg in data["scenarios"].items():
-            scenarios_new[name] = ScenarioConfig(
-                stages_ms=cfg["stages_ms"],
-                denoise_step_ms={int(k): v for k, v in cfg["denoise_step_ms"].items()},
-                expected_e2e_ms=float(cfg["expected_e2e_ms"]),
-                expected_avg_denoise_ms=float(cfg["expected_avg_denoise_ms"]),
-                expected_median_denoise_ms=float(cfg["expected_median_denoise_ms"]),
-                estimated_full_test_time_s=cfg.get("estimated_full_test_time_s"),
-            )
-
-        self.scenarios.update(scenarios_new)
+        self.scenarios.update(
+            {
+                name: ScenarioConfig.from_dict(cfg)
+                for name, cfg in data["scenarios"].items()
+            }
+        )
         return self
 
 
@@ -167,7 +211,7 @@ class DiffusionServerArgs:
     """Configuration for a single model/scenario test case."""
 
     model_path: str  # HF repo or local path
-    modality: str | None = None  # auto-inferred: "image" or "video" or "3d"
+    modality: str | None = None  # auto-inferred: "image", "video", "3d", or "action"
 
     custom_validator: str | None = None  # auto-derived unless explicitly overridden
     # resources
@@ -208,6 +252,8 @@ class DiffusionServerArgs:
             self.custom_validator = "video"
         elif self.modality == "3d":
             self.custom_validator = "mesh"
+        elif self.modality == "action":
+            self.custom_validator = "action"
 
 
 @lru_cache(maxsize=None)
@@ -219,6 +265,8 @@ def _infer_modality_from_model_path(model_path: str) -> str:
     task_type = model_info.pipeline_config_cls.task_type
     if task_type == ModelTaskType.I2M:
         return "3d"
+    if task_type.is_action_gen():
+        return "action"
     if task_type.is_image_gen():
         return "image"
     return "video"
@@ -244,6 +292,7 @@ class DiffusionSamplingParams:
 
     # output format
     output_format: str | None = None  # "png", "jpeg", "mp4", etc.
+    expect_audio_output: bool = False
 
     num_outputs_per_prompt: int = 1
 
@@ -269,6 +318,8 @@ class DiffusionTestCase:
     server_args: DiffusionServerArgs
     sampling_params: DiffusionSamplingParams | None = None
     run_perf_check: bool = True
+    # Validate every repetition against the same baseline and GT.
+    perf_repeat_requests: int = 1
     run_consistency_check: bool = True
     run_component_accuracy_check: bool = True
     run_models_api_check: bool = True
@@ -279,6 +330,8 @@ class DiffusionTestCase:
     run_multi_lora_api_check: bool = False
 
     def __post_init__(self) -> None:
+        if self.perf_repeat_requests < 1:
+            raise ValueError(f"{self.id}: perf_repeat_requests must be positive")
         if self.sampling_params is None:
             object.__setattr__(
                 self,
@@ -311,7 +364,13 @@ class DiffusionTestCase:
             )
 
 
-LINGBOT_WORLD_REALTIME_sampling_params = DiffusionSamplingParams(
+_REALTIME_MODEL_COMMON_EXTRAS = {
+    "seed": 42,
+    "num_inference_steps": 4,
+    "guidance_scale": 1.0,
+}
+
+REALTIME_MODEL_sampling_params = DiffusionSamplingParams(
     prompt=(
         "A slow aerial orbit around a pastel floating island hotel in the open "
         "ocean, hazy sunlight, turquoise water, toy-like architectural detail, "
@@ -332,9 +391,7 @@ LINGBOT_WORLD_REALTIME_sampling_params = DiffusionSamplingParams(
     },
     realtime_perf_ignore_initial_chunks=2,
     extras={
-        "seed": 42,
-        "num_inference_steps": 4,
-        "guidance_scale": 1.0,
+        **_REALTIME_MODEL_COMMON_EXTRAS,
         "realtime_causal_sink_size": 9,
         "realtime_causal_kv_cache_num_frames": 18,
         "condition_inputs": {
@@ -353,6 +410,23 @@ LINGBOT_WORLD_REALTIME_sampling_params = DiffusionSamplingParams(
                 [],
             ]
         },
+    },
+)
+
+
+PI05_ACTION_CI_sampling_params = DiffusionSamplingParams(
+    prompt="pick up the blue block",
+    extras={
+        "action_horizon": 50,
+        "action_dim": 32,
+        "state_dim": 14,
+        "image_size": 64,
+        "num_inference_steps": 2,
+        "seed": 0,
+        "enable_prefix_cache": False,
+        "enable_cuda_graph": True,
+        "action_max_abs_diff_threshold": 0.05,
+        "action_mean_abs_diff_threshold": 0.005,
     },
 )
 
@@ -383,6 +457,13 @@ class PerformanceSummary:
     step_metrics: list[float]
     sampled_steps: dict[int, float]
     all_denoise_steps: dict[int, float]
+    load_peak_vram_mb: float = 0.0
+    runtime_peak_vram_mb: float = 0.0
+    warmup_peak_vram_mb: float = 0.0
+    load_peak_allocated_mb: float = 0.0
+    runtime_peak_allocated_mb: float = 0.0
+    load_peak_host_anon_mb: float = 0.0
+    runtime_peak_host_anon_mb: float = 0.0
     frames_per_second: float | None = None
     total_frames: int | None = None
     avg_frame_time_ms: float | None = None
@@ -412,6 +493,32 @@ class PerformanceSummary:
                 val = item.get("execution_time_ms", 0.0)
                 stage_metrics[item["name"]] = val
 
+        load_peak_vram_mb = float(
+            record.memory_snapshots.get("load_peak", {}).get("peak_reserved_mb", 0.0)
+        )
+        runtime_peak_vram_mb = float(
+            record.memory_snapshots.get("runtime_peak", {}).get("peak_reserved_mb", 0.0)
+        )
+        warmup_peak_vram_mb = float(
+            record.memory_snapshots.get("warmup_peak", {}).get("peak_reserved_mb", 0.0)
+        )
+        load_peak_allocated_mb = float(
+            record.memory_snapshots.get("load_peak", {}).get("peak_allocated_mb", 0.0)
+        )
+        runtime_peak_allocated_mb = float(
+            record.memory_snapshots.get("runtime_peak", {}).get(
+                "peak_allocated_mb", 0.0
+            )
+        )
+        load_peak_host_anon_mb = float(
+            record.memory_snapshots.get("load_peak", {}).get("peak_host_anon_mb", 0.0)
+        )
+        runtime_peak_host_anon_mb = float(
+            record.memory_snapshots.get("runtime_peak", {}).get(
+                "peak_host_anon_mb", 0.0
+            )
+        )
+
         return PerformanceSummary(
             e2e_ms=e2e_ms,
             avg_denoise_ms=avg_denoise,
@@ -420,6 +527,13 @@ class PerformanceSummary:
             step_metrics=step_durations,
             sampled_steps=sampled_steps,
             all_denoise_steps=per_step,
+            load_peak_vram_mb=load_peak_vram_mb,
+            runtime_peak_vram_mb=runtime_peak_vram_mb,
+            warmup_peak_vram_mb=warmup_peak_vram_mb,
+            load_peak_allocated_mb=load_peak_allocated_mb,
+            runtime_peak_allocated_mb=runtime_peak_allocated_mb,
+            load_peak_host_anon_mb=load_peak_host_anon_mb,
+            runtime_peak_host_anon_mb=runtime_peak_host_anon_mb,
         )
 
 
@@ -552,6 +666,14 @@ T2V_sampling_params = DiffusionSamplingParams(
     prompt=T2V_PROMPT,
 )
 
+SANA_VIDEO_T2V_CI_sampling_params = DiffusionSamplingParams(
+    prompt="A curious raccoon walks through a sunlit forest. motion score: 30.",
+    output_size="832x480",
+    num_frames=17,
+    fps=16,
+    extras={"num_inference_steps": 8, "guidance_scale": 6.0, "seed": 42},
+)
+
 JOY_ECHO_T2V_CI_sampling_params = DiffusionSamplingParams(
     prompt=T2V_PROMPT,
     output_size="640x384",
@@ -571,6 +693,65 @@ MODELOPT_T2V_CI_sampling_params = DiffusionSamplingParams(
     extras={"num_inference_steps": 12, "seed": 0},
 )
 
+LINGBOT_VIDEO_T2V_CI_PROMPT = json.dumps(
+    {
+        "comprehensive_description": {
+            "scene_content_description": (
+                "A small silver robot arm on a white table slowly reaches "
+                "toward a red cube. The background is a plain, softly lit "
+                "laboratory wall."
+            ),
+            "camera_movement_description": (
+                "The camera is static at eye level, medium shot, with the "
+                "robot arm centered and in sharp focus."
+            ),
+        },
+        "camera_info": {
+            "color": "Neutral",
+            "frame_size": "Medium",
+            "shot_type_angle": "Eye level",
+            "lens_size": "Medium",
+            "composition": "Center",
+            "lighting": "Soft light",
+            "lighting_type": "Artificial light",
+        },
+        "world_knowledge": [],
+        "prominent_elements": [
+            {
+                "name": "robot arm",
+                "description": "A small silver robot arm with a two-finger gripper.",
+                "actions": [
+                    {
+                        "timestamp": "[0.0s - 1.0s]",
+                        "action": "reaches toward the red cube",
+                    }
+                ],
+                "location": "center of the frame",
+                "relative_size": "dominant",
+                "shape_and_color": "articulated silver metal arm",
+                "texture": "brushed metal",
+                "appearance_details": "two-finger gripper, visible joints",
+                "relationship": "reaching toward the red cube on the table",
+                "orientation": "upright, base on the table",
+                "pose": "reaching",
+                "expression": "",
+                "clothing": "",
+                "gender": "",
+                "skin_tone_and_texture": "",
+            }
+        ],
+    },
+    separators=(",", ":"),
+)
+
+LINGBOT_VIDEO_T2V_CI_sampling_params = DiffusionSamplingParams(
+    prompt=LINGBOT_VIDEO_T2V_CI_PROMPT,
+    output_size="384x640",
+    num_frames=17,
+    fps=16,
+    extras={"num_inference_steps": 12, "seed": 0},
+)
+
 TI2V_sampling_params = DiffusionSamplingParams(
     prompt="The man in the picture slowly turns his head, his expression enigmatic and otherworldly. The camera performs a slow, cinematic dolly out, focusing on his face. Moody lighting, neon signs glowing in the background, shallow depth of field.",
     image_path="https://is1-ssl.mzstatic.com/image/thumb/Music114/v4/5f/fa/56/5ffa56c2-ea1f-7a17-6bad-192ff9b6476d/825646124206.jpg/600x600bb.jpg",
@@ -584,6 +765,28 @@ SANA_WM_TI2V_CI_sampling_params = DiffusionSamplingParams(
     output_size="384x640",
     num_frames=17,
     extras={"num_inference_steps": 12, "seed": 0, "guidance_scale": 4.5},
+)
+
+LONGLIVE2_T2V_CI_sampling_params = replace(
+    REALTIME_MODEL_sampling_params,
+    image_path=None,
+    num_frames=61,
+    realtime_num_chunks=None,
+    realtime_events=[],
+    realtime_perf_thresholds={},
+    realtime_perf_ignore_initial_chunks=0,
+    extras=dict(_REALTIME_MODEL_COMMON_EXTRAS),
+)
+
+LONGLIVE2_I2V_CI_sampling_params = replace(
+    REALTIME_MODEL_sampling_params,
+    output_size="960x928",
+    num_frames=61,
+    realtime_num_chunks=None,
+    realtime_events=[],
+    realtime_perf_thresholds={},
+    realtime_perf_ignore_initial_chunks=0,
+    extras=dict(_REALTIME_MODEL_COMMON_EXTRAS),
 )
 
 TURBOWAN_I2V_sampling_params = DiffusionSamplingParams(
@@ -646,6 +849,8 @@ def get_default_sampling_params_for_model_task(
         return TI2V_sampling_params
     if task_type == ModelTaskType.I2M:
         return HUNYUAN3D_SHAPE_sampling_params
+    if task_type.is_action_gen():
+        return PI05_ACTION_CI_sampling_params
     raise ValueError(f"No default sampling params for model task {task_type!r}")
 
 
@@ -679,6 +884,7 @@ PERF_BASELINE_FILE_BY_PLATFORM = {
     "h100": "h100.json",
     "b200": "b200.json",
     "5090": "5090.json",
+    "xpu_b60": "xpu_b60.json",
 }
 PERF_BASELINE_PLATFORM_ALIASES = {
     "sm90": "h100",
@@ -690,6 +896,8 @@ PERF_BASELINE_PLATFORM_ALIASES = {
     "sm120": "5090",
     "rtx5090": "5090",
     "5090": "5090",
+    "xpu": "xpu_b60",
+    "bmg": "xpu_b60",
 }
 
 
@@ -709,6 +917,8 @@ def get_perf_baseline_platform() -> str:
     override = os.getenv(PERF_BASELINE_PLATFORM_ENV)
     if override:
         return _normalize_perf_baseline_platform(override)
+    if current_platform.is_xpu():
+        return "xpu_b60"
     if current_platform.is_sm120():
         return "5090"
     if current_platform.is_blackwell():
@@ -723,6 +933,14 @@ def get_perf_baseline_path(platform: str | None = None) -> Path:
         else get_perf_baseline_platform()
     )
     return PERF_BASELINE_DIR / PERF_BASELINE_FILE_BY_PLATFORM[baseline_platform]
+
+
+def get_perf_baseline_update_path() -> Path:
+    if current_platform.is_npu():
+        return Path(__file__).parent / "ascend" / "perf_baselines_npu.json"
+    if current_platform.is_musa():
+        return Path(__file__).parent / "musa" / "perf_baselines_musa.json"
+    return get_perf_baseline_path()
 
 
 def _make_modelopt_ci_case(
