@@ -1010,6 +1010,22 @@ def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
     return major, minor
 
 
+def is_sm70_volta(device_id: int = 0) -> bool:
+    """True on NVIDIA Volta (e.g. V100, sm_70)."""
+    if not is_cuda():
+        return False
+    major, minor = get_device_capability(device_id)
+    return major == 7 and minor == 0
+
+
+def is_pre_sm80(device_id: int = 0) -> bool:
+    """True on CUDA GPUs without native bfloat16 tensor-core support."""
+    if not is_cuda():
+        return False
+    major, _ = get_device_capability(device_id)
+    return major is not None and major < 8
+
+
 def get_compiler_backend(mode=None) -> str:
     # OOT platforms provide their own compile backend.
     if current_platform.is_out_of_tree():

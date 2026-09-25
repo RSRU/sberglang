@@ -1,5 +1,7 @@
 import sys
 
+import math
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -7,6 +9,7 @@ import torch.nn.functional as F
 from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.kernels.ops.activation.activation import (
     SUPPORTED_ACTIVATIONS,
+    new_gelu,
     relu2,
     run_activation,
 )
@@ -237,6 +240,23 @@ def test_relu2_negative_inputs_zeroed() -> None:
     x = -torch.rand((64, 512), dtype=torch.bfloat16, device="cuda") - 1e-3
     out = relu2(x)
     assert torch.count_nonzero(out) == 0
+
+
+def _reference_new_gelu(x: torch.Tensor) -> torch.Tensor:
+    c = math.sqrt(2.0 / math.pi)
+    return (0.5 * x * (1.0 + torch.tanh(c * (x + 0.044715 * torch.pow(x, 3.0))))).to(
+        dtype=x.dtype
+    )
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("shape", UNARY_SHAPES)
+def test_new_gelu_correctness(dtype: torch.dtype, shape: tuple[int, ...]) -> None:
+    x = torch.randn(shape, dtype=dtype, device="cuda")
+    out = new_gelu(x)
+    expected = _reference_new_gelu(x.float())
+    atol, rtol = _tolerances(dtype)
+    torch.testing.assert_close(out, expected, atol=atol, rtol=rtol)
 
 
 if __name__ == "__main__":
