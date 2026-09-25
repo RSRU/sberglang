@@ -282,7 +282,10 @@ else:
 
     class SchedulerMlxOverlapMixin:
         pass
-
+try:
+    from sgl_interrupt import InterruptController
+except ImportError:  # pure-Python fallback with the same API (see 2.3)
+    from sglang.srt.managers.interrupt_fallback import InterruptController
 
 logger = logging.getLogger(__name__)
 
@@ -556,6 +559,8 @@ class Scheduler(
         self.init_batch_result_processor()
 
         self.is_initializing = False
+
+        self.interrupt = InterruptController(ttl_secs=600.0)
 
     def init_zbal_on_npu(self):
         if _is_npu:
@@ -2109,6 +2114,15 @@ class Scheduler(
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
             )
             req.tokenizer = self.tokenizer
+            req.interrupt_epoch = self.interrupt.admit()
+
+            # The abort may have overtaken the request (multiple tokenizer workers,
+             # DP-attention forwarding, client retry with the same rid).
+            if self.interrupt.should_interrupt(req.rid, req.interrupt_epoch):
+                logger.debug(f"Request arrived already aborted. {req.rid=}")
+                req.set_finish_with_abort("Request aborted by the client before scheduling")
+                self._add_request_to_queue(req)   # finished reqs are streamed out & dropped
+                return
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
@@ -3880,120 +3894,86 @@ class Scheduler(
         return RpcReqOutput(success=success, message="" if not exec else str(exec))
 
     def abort_request(self, recv_req: AbortReq):
-        if (chunked_req := self.chunked_req) is not None:
-            if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
-                self._pending_chunked_abort_req = chunked_req
+        abort_all = getattr(recv_req, "abort_all", False)
+        reason = "client_disconnect"
 
-        # todo hisparse, release resources for abort requests in hisparse coordinator
-        # Delete requests in the waiting queue
-        to_del = []
-        for i, req in enumerate(self.waiting_queue):
-            if recv_req.abort_all or req.rid.startswith(recv_req.rid):
-                to_del.append(i)
+        # 1) Persist the intent in the Rust registry FIRST so nothing that is
+        #    in flight between structures can slip through.
+        if abort_all:
+            self.interrupt.abort_all(reason)
+        else:
+            self.interrupt.abort(recv_req.rid, reason)
 
-        # Sort in reverse order to avoid index issues when deleting
+        # 2) Waiting queue: drop immediately (no KV allocated yet).
+        to_del = [
+            i for i, req in enumerate(self.waiting_queue)
+            if abort_all or req.rid.startswith(recv_req.rid)
+        ]
         for i in reversed(to_del):
-            # Abort method 1: directly pop from the queue
-            # This only works for requests that have not started anything.
-            # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
-            if self.enable_hicache_storage:
-                # to release prefetch events associated with the request
-                self.tree_cache.release_aborted_request(req.rid)
-            self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
-            # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
-            if self.disaggregation_mode == DisaggregationMode.DECODE:
-                release_kv_cache(req, self.tree_cache)
-            # For disaggregation prefill mode, free the metadata buffer index
-            if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                bootstrap_pending = req.pending_bootstrap
-                maybe_release_metadata_buffer(
-                    req, self.req_to_metadata_buffer_idx_allocator
-                )
-                if (
-                    bootstrap_pending
-                    and hasattr(req, "disagg_kv_sender")
-                    and req.disagg_kv_sender is not None
-                ):
-                    if hasattr(req.disagg_kv_sender, "abort"):
-                        req.disagg_kv_sender.abort()
-
-            # For mamba radix cache
-            if (
-                req.mamba_pool_idx is not None
-                and self.disaggregation_mode != DisaggregationMode.DECODE
-            ):
-                release_kv_cache(req, self.tree_cache, is_insert=False)
+            self.send_to_tokenizer.send_pyobj(AbortReq(req.rid))
+            self.interrupt.ack(req.rid)
             logger.debug(f"Abort queued request. {req.rid=}")
 
-        # Delete the requests in the grammar queue
-        # Abort method 2: call `set_finish_with_abort`
-        # The request will still run one prefill forward pass.
-        # In this case, we change the input_ids to be only one token to make this prefill cheap.
-        self.grammar_manager.abort_requests(recv_req)
+        # 3) Chunked prefill in progress: the original code missed this, so a long
+        #    prompt kept prefilling after the client left.
+        cr = self.chunked_req
+        if cr is not None and not cr.finished():
+            if self.interrupt.should_interrupt(cr.rid, getattr(cr, "interrupt_epoch", 0)):
+                logger.debug(f"Abort chunked-prefill request. {cr.rid=}")
+                cr.to_abort = True
 
-        # Delete requests not in the waiting queue when PD disaggregation is enabled
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            # Abort requests that have not yet been bootstrapped
-            for req in self.disagg_prefill_bootstrap_queue.queue:
-                if recv_req.abort_all or req.rid.startswith(recv_req.rid):
-                    logger.debug(f"Abort bootstrap queue request. {req.rid=}")
-                    if self.enable_hicache_storage:
-                        self.tree_cache.release_aborted_request(req.rid)
-
-                    if hasattr(req.disagg_kv_sender, "abort"):
-                        req.disagg_kv_sender.abort()
-
-            # Abort in-flight requests
-            for req in self.disagg_prefill_inflight_queue:
-                if recv_req.abort_all or req.rid.startswith(recv_req.rid):
-                    logger.debug(f"Abort inflight queue request. {req.rid=}")
-                    if hasattr(req.disagg_kv_sender, "abort"):
-                        req.disagg_kv_sender.abort()
-
-        elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            # Abort requests that have not yet finished preallocation
-            for decode_req in self.disagg_decode_prealloc_queue.queue:
-                if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
-                    logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
-                    decode_req.kv_receiver.abort()
-
-            # Abort requests waiting for kvcache to release tree cache
-            for decode_req in self.disagg_decode_transfer_queue.queue:
-                if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
-                    logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
-                    decode_req.kv_receiver.abort()
-
-            # Abort requests already retracted to CPU cache
-            if self.disagg_decode_prealloc_queue.retracted_queue:
-                remaining_retracted = []
-                for decode_req in self.disagg_decode_prealloc_queue.retracted_queue:
-                    if recv_req.abort_all or decode_req.rid.startswith(recv_req.rid):
-                        assert hasattr(decode_req, "kv_cache_cpu")
-                        del decode_req.kv_cache_cpu
-                        self.ipc_channels.send_to_tokenizer.send_output(
-                            AbortReq(rid=decode_req.rid), decode_req
-                        )
-                    else:
-                        remaining_retracted.append(decode_req)
-                self.disagg_decode_prealloc_queue.retracted_queue = remaining_retracted
-
-        # Delete requests in the running batch
-        if self.ps.pp_size == 1:
-            inflight_batches = [self.running_batch, self.last_batch]
+        # 4) Running batch (+ cur_batch when prefill/decode overlap).
+        if self.cur_batch is self.running_batch or self.cur_batch is None:
+            reqs = self.running_batch.reqs
         else:
-            inflight_batches = [*self.running_mbs, *self.mbs]
+            reqs = self.running_batch.reqs + self.cur_batch.reqs
 
-        inflight_reqs = {r for b in inflight_batches if b is not None for r in b.reqs}
-        for req in inflight_reqs:
-            if not req.finished() and (
-                recv_req.abort_all or req.rid.startswith(recv_req.rid)
-            ):
-                # Abort method 3: set `to_finish`
-                # The request will still run one decode forward pass.
-                # Then we reuse all existing code to clean up the KV cache allocation.
+        hit = set(self.interrupt.filter_aborted(
+            [(r.rid, getattr(r, "interrupt_epoch", 0)) for r in reqs if not r.finished()]
+        ))
+        for req in reqs:
+            if req.rid in hit:
+                # The request runs at most one more forward pass; check_finished()
+                # then turns to_abort into FINISH_ABORT and the normal cleanup path
+                # frees its KV cache.
                 logger.debug(f"Abort running request. {req.rid=}")
-                req.to_finish = FINISH_ABORT()
+                req.to_abort = True
+
+    def apply_pending_interrupts(self, batch) -> int:
+        if batch is None or len(self.interrupt) == 0:
+            return 0
+        hit = set(self.interrupt.filter_aborted(
+            [(r.rid, getattr(r, "interrupt_epoch", 0)) for r in batch.reqs if not r.finished()]
+        ))
+        for r in batch.reqs:
+            if r.rid in hit:
+                r.to_abort = True
+        return len(hit)
+
+    def _finish_aborted_chunked_req(self):
+        """Stop a chunked prefill early and release the KV pages of finished chunks."""
+        req = self.chunked_req
+        self.chunked_req = None
+        req.finished_reason = FINISH_ABORT()
+        self.tree_cache.cache_finished_req(req)     # frees req_pool_idx + KV written so far
+        self.stream_output([req], req.return_logprob)
+        self.interrupt.ack(req.rid)
+
+        # get_new_batch_prefill(): before continuing the chunked request
+        if self.chunked_req is not None and self.chunked_req.to_abort:
+            self._finish_aborted_chunked_req()
+
+        # get_next_batch_to_run(): right before returning the batch
+        self.apply_pending_interrupts(req)
+
+        # event_loop_normal() / event_loop_overlap(): periodic housekeeping
+        if self.forward_ct % 1024 == 0:
+            self.interrupt.gc()
+
+        # stream_output(): after a finished request is emitted
+        if req.finished() and isinstance(req.finished_reason, FINISH_ABORT):
+            self.interrupt.ack(req.rid)
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()
